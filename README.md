@@ -3,7 +3,7 @@
 SPECInt2006의 특성을 반영한 마이크로 벤치마크 스위트입니다.
 
 ## 특징
-
+https://github.com/SweetWeeds/specint-2006-micro
 - **플랫폼 지원**:
   - x86-64 Linux (native)
   - nexus-am (riscv64-xs, riscv64-xs-flash)

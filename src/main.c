@@ -16,6 +16,33 @@ static output_format_t output_format = OUTPUT_HUMAN;
 static bench_stats_t all_stats[MAX_KERNELS];
 static int stats_count = 0;
 
+/* ============================================================================
+ * Base Cycle Counts for SPECInt2006 Score Calculation
+ * Score = BASE_CYCLE / actual_cycles (score of 1.0 when cycles == BASE_CYCLE)
+ * Values from BASE_CYCLE.txt, stored as integer * 100 for precision
+ * ============================================================================ */
+typedef struct {
+    const char *benchmark;
+    uint64_t base_cycle_x100;  /* Base cycle * 100 for integer arithmetic */
+} benchmark_base_t;
+
+static const benchmark_base_t base_cycles[] = {
+    { "400.perlbench",    76896437 },  /* 768964.37 */
+    { "401.bzip2",       250882020 },  /* 2508820.2 */
+    { "403.gcc",         375198808 },  /* 3751988.08 */
+    { "429.mcf",           7163965 },  /* 71639.65 */
+    { "445.gobmk",       752228100 },  /* 7522281 */
+    { "456.hmmer",       755623794 },  /* 7556237.94 */
+    { "458.sjeng",          103360 },  /* 1033.6 */
+    { "462.libquantum",  331920736 },  /* 3319207.36 */
+    { "464.h264ref",     448875792 },  /* 4488757.92 */
+    { "471.omnetpp",     172806876 },  /* 1728068.76 */
+    { "473.astar",      2553353913 },  /* 25533539.13 */
+    { "483.xalancbmk",    29604689 },  /* 296046.89 */
+    { NULL, 0 }
+};
+#define NUM_BENCHMARKS 12
+
 /*
  * Register a kernel
  */
@@ -183,7 +210,35 @@ static uint64_t calc_geomean(const bench_stats_t *stats, int count)
 }
 
 /*
- * Print benchmark summary with geomean and score
+ * Per-benchmark statistics for BASE_CYCLE scoring
+ */
+typedef struct {
+    const char *benchmark;
+    uint64_t cycles_sum;
+    uint64_t base_cycle_x100;
+    uint64_t score_x100;  /* Score * 100 = base_cycle_x100 / cycles */
+} benchmark_score_t;
+
+/*
+ * Calculate per-benchmark sum of cycles
+ */
+static uint64_t calc_benchmark_sum(const bench_stats_t *stats, int count, const char *benchmark)
+{
+    uint64_t sum = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (stats[i].kernel->source_benchmark &&
+            strcmp(stats[i].kernel->source_benchmark, benchmark) == 0) {
+            sum += stats[i].cycles_avg;
+        }
+    }
+
+    return sum;
+}
+
+/*
+ * Print benchmark summary with BASE_CYCLE scoring
+ * Score = BASE_CYCLE / actual_cycles
  */
 static void bench_print_summary(const bench_stats_t *stats, int count)
 {
@@ -201,35 +256,117 @@ static void bench_print_summary(const bench_stats_t *stats, int count)
         total_cycles += stats[i].cycles_avg;
     }
 
-    uint64_t geomean = calc_geomean(stats, count);
-    uint64_t score = geomean > 0 ? 1000000000ULL / geomean : 0;
+    /* Calculate per-benchmark statistics */
+    benchmark_score_t bench_scores[NUM_BENCHMARKS];
+    int bench_count = 0;
+
+    for (int b = 0; base_cycles[b].benchmark != NULL; b++) {
+        const char *bench_name = base_cycles[b].benchmark;
+        uint64_t sum = calc_benchmark_sum(stats, count, bench_name);
+
+        if (sum > 0) {
+            bench_scores[bench_count].benchmark = bench_name;
+            bench_scores[bench_count].cycles_sum = sum;
+            bench_scores[bench_count].base_cycle_x100 = base_cycles[b].base_cycle_x100;
+            /* Score = BASE_CYCLE / cycles, stored as score * 100 */
+            bench_scores[bench_count].score_x100 = base_cycles[b].base_cycle_x100 / sum;
+            bench_count++;
+        }
+    }
+
+    /* Calculate overall geomean score (geometric mean of all benchmark scores) */
+    uint64_t score_log_sum = 0;
+    const int FRAC_BITS = 20;
+    for (int i = 0; i < bench_count; i++) {
+        uint64_t val = bench_scores[i].score_x100;
+        if (val == 0) val = 1;
+        int msb = 63 - clz64(val);
+        uint64_t log2_val = ((uint64_t)msb << FRAC_BITS);
+        if (msb > 0 && msb < 44) {
+            uint64_t base = 1ULL << msb;
+            uint64_t frac = ((val - base) << FRAC_BITS) / base;
+            log2_val += frac;
+        }
+        score_log_sum += log2_val;
+    }
+
+    uint64_t geomean_score_x100 = 0;
+    if (bench_count > 0) {
+        uint64_t log_avg = score_log_sum / bench_count;
+        int int_part = (int)(log_avg >> FRAC_BITS);
+        uint64_t frac_part = log_avg & ((1ULL << FRAC_BITS) - 1);
+        if (int_part < 63) {
+            geomean_score_x100 = 1ULL << int_part;
+            geomean_score_x100 += (geomean_score_x100 * frac_part) >> FRAC_BITS;
+        }
+    }
+
+    /* Calculate raw geomean cycles */
+    uint64_t raw_geomean = calc_geomean(stats, count);
 
     if (output_format == OUTPUT_HUMAN) {
         printf("--------------------------------------------------------------------------------\n");
         printf("\n");
+        printf("Per-Benchmark Scores (BASE_CYCLE / Cycles):\n");
+        printf("%-16s %12s %14s %8s\n", "Benchmark", "Cycles", "Base Cycle", "Score");
+        printf("--------------------------------------------------------------------------------\n");
+        for (int i = 0; i < bench_count; i++) {
+            printf("%-16s %12lu %14lu %5lu.%02lu\n",
+                   bench_scores[i].benchmark,
+                   (unsigned long)bench_scores[i].cycles_sum,
+                   (unsigned long)(bench_scores[i].base_cycle_x100 / 100),
+                   (unsigned long)(bench_scores[i].score_x100 / 100),
+                   (unsigned long)(bench_scores[i].score_x100 % 100));
+        }
+        printf("--------------------------------------------------------------------------------\n");
+        printf("%-16s %12s %14s %5lu.%02lu\n",
+               "GEOMEAN", "-", "-",
+               (unsigned long)(geomean_score_x100 / 100),
+               (unsigned long)(geomean_score_x100 % 100));
+        printf("\n");
         printf("Summary:\n");
         printf("  Kernels:        %d total, %d passed, %d failed\n", count, passed, failed);
         printf("  Total Cycles:   %lu\n", (unsigned long)total_cycles);
-        printf("  Geomean Cycles: %lu\n", (unsigned long)geomean);
-        printf("  Score/GHz:      %lu (higher is better)\n", (unsigned long)score);
+        printf("  Raw Geomean:    %lu cycles\n", (unsigned long)raw_geomean);
+        printf("  Final Score:    %lu.%02lu\n",
+               (unsigned long)(geomean_score_x100 / 100),
+               (unsigned long)(geomean_score_x100 % 100));
         printf("\n");
     } else if (output_format == OUTPUT_CSV) {
+        printf("\n");
+        printf("# Per-Benchmark Scores (BASE_CYCLE / Cycles)\n");
+        printf("benchmark,cycles_sum,base_cycle,score\n");
+        for (int i = 0; i < bench_count; i++) {
+            printf("%s,%lu,%lu,%.2f\n",
+                   bench_scores[i].benchmark,
+                   (unsigned long)bench_scores[i].cycles_sum,
+                   (unsigned long)(bench_scores[i].base_cycle_x100 / 100),
+                   bench_scores[i].score_x100 / 100.0);
+        }
+        printf("GEOMEAN,-,-,%.2f\n", geomean_score_x100 / 100.0);
         printf("\n");
         printf("# Summary\n");
         printf("kernels_total,%d\n", count);
         printf("kernels_passed,%d\n", passed);
         printf("kernels_failed,%d\n", failed);
         printf("total_cycles,%lu\n", (unsigned long)total_cycles);
-        printf("geomean_cycles,%lu\n", (unsigned long)geomean);
-        printf("score_per_ghz,%lu\n", (unsigned long)score);
+        printf("raw_geomean_cycles,%lu\n", (unsigned long)raw_geomean);
+        printf("final_score,%.2f\n", geomean_score_x100 / 100.0);
     } else {
+        printf("[PER_BENCHMARK]\n");
+        for (int i = 0; i < bench_count; i++) {
+            printf("%s=%lu,%.2f\n",
+                   bench_scores[i].benchmark,
+                   (unsigned long)bench_scores[i].cycles_sum,
+                   bench_scores[i].score_x100 / 100.0);
+        }
         printf("[SUMMARY]\n");
         printf("kernels_total=%d\n", count);
         printf("kernels_passed=%d\n", passed);
         printf("kernels_failed=%d\n", failed);
         printf("total_cycles=%lu\n", (unsigned long)total_cycles);
-        printf("geomean_cycles=%lu\n", (unsigned long)geomean);
-        printf("score_per_ghz=%lu\n", (unsigned long)score);
+        printf("raw_geomean_cycles=%lu\n", (unsigned long)raw_geomean);
+        printf("final_score=%.2f\n", geomean_score_x100 / 100.0);
         printf("[END]\n");
     }
 }
